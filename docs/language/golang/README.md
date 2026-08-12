@@ -511,6 +511,7 @@ goroutine 泄露可通过 `pprof` 调试。
 ### 时间与数值计算
 - `time`：
     - `time.Now()`：获取当前时间
+    - `time.NewTimer()`：单次触发，通过 `timer.C` 接收到期信号，使用后需调用 `timer.Stop()` 释放资源
     - `time.NewTicker()`：定时触发，返回 `<-chan Time`，使用后需 `Ticker.Stop()` 释放资源
     - `time.After()`：一段时间后触发，返回 `<-chan Time`，不可复用
     - `time.Sleep()`：休眠一段时间
