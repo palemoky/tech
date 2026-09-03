@@ -27,6 +27,9 @@ nav = [
     { "稳定性" = "governance/stability/README.md" },
     { "可观测性" = "governance/observability/README.md" },
   ] },
+  { "AI" = [
+    {"AI"="ai/README.md"},
+  ]},
 ]
 site_name = "Tech Notes"
 site_description = "Backend engineering notes by Palemoky"
