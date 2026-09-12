@@ -54,7 +54,7 @@
     - Success Rate
     - Business Metric
 
-## Function Call
+## Tool Call / Function Calling
 
 LLM 擅长语义理解与意图识别，但存在知识时效截止、缺乏确定性计算能力、无法直接操作外部系统等局限。
 
@@ -102,7 +102,16 @@ LLM 擅长语义理解与意图识别，但存在知识时效截止、缺乏确�
 
 ## RAG
 
-## 向量数据库
+RAG 的完整流程可分为**离线索引**与**在线推理**两个阶段：
+
+**离线索引**：解析、清洗文档 → 分块（Chunking） → 通过 Embedding 模型向量化 → 存入向量数据库。
+
+**在线推理**：
+1. **检索 (Retrieval)**：根据用户问题，从向量数据库中检索语义最相关的 top-K 候选文档片段。
+2. **增强 (Augmentation)**：将检索到的文档片段与用户问题组合，构建扩展上下文（Context），作为 Prompt 一并送入 LLM。
+3. **生成 (Generation)**：LLM 基于扩展上下文进行回答，确保答案的准确性和可追溯性。
+
+### 向量数据库
 
 | 产品 | 特点 | 适用场景 |
 | --- | --- | --- |
@@ -118,40 +127,145 @@ ANN（近似最邻近）算法：
 - IVF（倒排文件）：聚类划分桶，查询只搜索部分桶；需训练，适合大规模
 - PQ（乘积量化）：向量压缩，节省内存、加速距离计算；有损，精度略降
 
-### 向量化
+### 图数据库与知识图谱
 
-### 检索策略
-
-| 检索方式 | 优势 | 劣势 |
-| --- | --- | --- |
-| 向量检索 | 语义相似，处理同义词/改写 | 精确词元匹配差，数值模糊 |
-| BM25 | 精确词元匹配，无需训练 | 无语义理解，无法跨文档推理 |
-| GraphRAG | 图遍历实现多跳推理 | 构建成本高，需要图数据库 |
-| 混合检索 | 兼顾语义与精确匹配 | 仍无法解决多跳推理 |
-
+在 RAG 中，纯向量检索仅关注局部语义相似度，难以捕捉实体间的结构化关联——例如"某人创立了某公司"或"某项目依赖某技术"这类显式关系。图数据库通过构建知识图谱（Knowledge Graph），将离散的文档信息组织为结构化的实体-关系网络，从而帮助 Agent 实现**跨文档关联与多跳关系推理**。
 
 #### Neo4j
 
-节点
-关系
-属性
+Neo4j 是目前最主流的原生图数据库，采用 LPG（Labeled Property Graph，标签属性图）模型，其核心由四个基本元素构成：
+
+1. **节点 (Node)**：表示实体或概念（如 `Person`、`Company`、`Project`）。
+2. **标签 (Label)**：对节点进行分组分类（类似关系型数据库中"表"的概念，且一个节点可拥有多个标签，如 `(:Person:Founder)`）。
+3. **关系 (Relationship)**：连接两个节点的**有向边**，具有明确的方向和类型（如 `-[:FOUNDED]->`、`-[:DEPENDS_ON]->`）。
+4. **属性 (Property)**：附加在节点或关系上的键值对（Key-Value），用于存储结构化数据（如节点属性 `{name: "乔布斯", birth: 1955}`，关系属性 `{since: 1976}`）。
+
+```mermaid
+graph LR
+    A["(:Person {name: 'Steve Jobs'})"] -->|"[:FOUNDED {since: 1976}]"| B["(:Company {name: 'Apple'})"]
+    B -->|"[:PRODUCED]"| C["(:Product {name: 'iPhone'})"]
+```
+
+##### Cypher 查询语言
+
+Cypher 是 Neo4j 原生的声明式图查询语言，采用直观的 ASCII 艺术箭头语法 `(节点)-[关系]->(节点)` 来描述图模式，使查询逻辑贴近人类对关系的自然表达：
+
+```cypher
+// 查询创立了 Apple 公司的所有人姓名
+MATCH (p:Person)-[:FOUNDED]->(c:Company {name: 'Apple'})
+RETURN p.name;
+
+// 查找两度关系以内的所有上下游（多跳推理）
+MATCH (c:Company {name: 'Apple'})-[*1..2]-(related)
+RETURN related;
+```
+
+### 检索策略
+
+| 检索方式 | 最优场景 | 弱项 |
+|----------|----------|------|
+| 向量检索 (Vector) | 语义相似，同义词/改写 | 精确词元、多跳推理 |
+| BM25 | 精确词元、日期/代码 | 语义理解 |
+| 图谱检索 (Graph) | 多跳关系推理 | 模糊语义查询 |
+| **RRF 融合** | **覆盖所有场景** | 依赖各路质量 |
+
+```
+                   ┌─────────────┐
+                   │    Query    │
+                   └──────┬──────┘
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+   向量检索(Vector)   BM25 检索      图谱检索(Graph)
+   语义相似度          精确词元匹配    多跳关系遍历
+          └───────────────┼───────────────┘
+                          ▼
+                   RRF 融合排序
+                   score = Σ 1/(k + rank)
+                          ▼
+                   最终排序结果
+```
+
+#### RRF（Reciprocal Rank Fusion）
+
+RRF 是一种无参数的排名融合算法，将多路检索器的排名列表合并为一份最终排序，**只依赖排名、不依赖原始分数**，因此无需对不同检索器的分数做归一化。
+
+$$
+\text{RRF}(d) = \sum_{r \in R} \frac{1}{k + \text{rank}_r(d)}
+$$
+
+- $R$：所有检索器的结果列表集合
+- $k$：平滑常数（默认 60），用于抑制头部排名过度主导，使排名靠后的文档也能贡献有效分数
+- $\text{rank}_r(d)$：文档 $d$ 在检索器 $r$ 中的排名（从 1 开始）
+
+**核心优势**：
+- **无需分数归一化**——向量/BM25/Graph 三路分数尺度不同也能直接合并
+- **只关心排名**——对各检索器的打分分布无假设
+- **多路投票效应**——被多个检索器同时召回的文档会获得更高的综合分
+
+#### MMR（Maximal Marginal Relevance）
+
+MMR 在保证相关性的同时引入**多样性约束**，防止检索结果中出现大量语义重复的文档片段：
+
+$$
+\text{MMR}(d_i) = \lambda \cdot \text{Sim}(q, d_i) - (1-\lambda) \cdot \max_{d_j \in S} \text{Sim}(d_i, d_j)
+$$
+
+- $\text{Sim}(q, d_i)$：文档 $d_i$ 与查询 $q$ 的相关性（如余弦相似度）
+- $\max_{d_j \in S} \text{Sim}(d_i, d_j)$：文档 $d_i$ 与已选集合 $S$ 中最相似文档的相似度
+- $\lambda$：权衡参数（0~1），$\lambda$ 越大越偏向相关性，越小越偏向多样性
+
+**典型用途**：当 top-K 检索结果存在大量近似重复片段时，使用 MMR 重排序可以显著提升上下文覆盖度，让 LLM 获得更全面的参考信息。
+
+#### Cross-Encoder Rerank
+
+Cross-Encoder 是一种精排模型，将 `(query, document)` **拼接为一个序列**送入 Transformer，直接输出相关性得分。相比检索阶段使用的 Bi-Encoder（分别编码 query 和 document 再算相似度），Cross-Encoder 能捕捉更细粒度的交互语义，但计算成本更高。
+
+| 对比 | Bi-Encoder | Cross-Encoder |
+|------|-----------|--------------|
+| 输入方式 | query 与 doc 分别编码 | query + doc 拼接编码 |
+| 速度 | 快（可预计算向量） | 慢（每对都需推理） |
+| 精度 | 较高 | **更高**（捕捉交互特征） |
+| 典型角色 | 粗排 / 召回 | **精排 / Rerank** |
+
+**工业实践**：先用向量检索 + BM25 粗排召回 top-K 候选（如 50~100 篇），再用 Cross-Encoder 对候选集精排，取 top-N（如 5~10 篇）送入 LLM，在精度与延迟间取得平衡。
+
+综合以上策略，工业级 RAG 系统的典型架构为：**Vector + BM25 + Graph 三路并行召回 → RRF 融合 → MMR 去重 → Cross-Encoder 精排**，逐层筛选出最终送入 LLM 的高质量上下文。
 
 ### 评估
 
-#### 四大指标
+RAG 系统的评估需要同时衡量**检索质量**和**生成质量**两个维度。当前主流方案采用 **LLM-as-Judge**——用一个 LLM 对另一个 LLM 的输出进行自动化评分，替代人工标注。
 
-| 指标 | 含义 | 参考阈值 | 可能原因 | 优化方向 |
-| --- | --- | --- | --- | --- |
-| Context Recall | 判断检索出的文档是否包含回答问题所需的信息 | 0.8-0.9 | top_k 太小；chunk 太大；embedding 召回差 | 增加 top_k；缩小 chunk_size；更换 embedding 模型 |
-| Context Precision | 判断检索出的文档是否与问题相关，去除噪音 | 0.7-0.85 | 检索结果包含大量无关片段 | 增加 Rerank；提高哦相似度阈值；改善文档质量 |
-| Answer Relevancy | 判断最终答案是否切题 | 0.8-0.9 | Prompt 没有引导模型直接回答；答案太长绕弯 | Query重写；优化 response prompt |
-| Faithfulness | 判断最终答案是否基于检索到的上下文 | 0.85-0.95 | System prompt 约束弱；检索内容不足 | 强化system prompt；先提到recall |
+#### 核心指标
 
-> 优先级建议：先修 Recall → 再修 Faithfulness → 再修 Precision → 最后 Relevancy
+**检索质量**（评估检索器是否找到了正确且精准的上下文）：
 
-#### ragas/DeepEval
+| 指标 | 含义 | 参考阈值 | 低分原因 | 优化方向 |
+|------|------|----------|----------|----------|
+| Context Recall | 检索结果是否**覆盖**了回答所需的全部信息 | 0.8–0.9 | top_k 太小；chunk 太大；Embedding 召回差 | 增大 top_k；缩小 chunk_size；更换 Embedding 模型 |
+| Context Precision | 检索结果中**有多少是真正相关的**（信噪比） | 0.7–0.85 | 召回了大量无关片段 | 增加 Rerank；提高相似度阈值；改善文档质量 |
 
+**生成质量**（评估 LLM 是否基于上下文给出了准确且切题的回答）：
 
+| 指标 | 含义 | 参考阈值 | 低分原因 | 优化方向 |
+|------|------|----------|----------|----------|
+| Faithfulness | 答案是否**忠实于**检索到的上下文（无幻觉） | 0.85–0.95 | System Prompt 约束弱；检索内容不足 | 强化 System Prompt 约束；优先提升 Recall |
+| Answer Relevancy | 答案是否**切题**回答了用户问题 | 0.8–0.9 | Prompt 未引导直接回答；答案冗长绕弯 | Query 重写；优化 Response Prompt |
+
+> **调优优先级**：Recall → Faithfulness → Precision → Relevancy
+> 检索召回是一切的基础——如果相关文档根本没被检索到，后续的精排和生成都无法挽救。
+
+#### 评估框架：Ragas & DeepEval
+
+| 对比 | Ragas | DeepEval |
+|------|-------|---------|
+| 定位 | 专注 RAG 评估的轻量框架 | 通用 LLM 评估平台（覆盖 RAG + Agent + 对话） |
+| 指标 | Faithfulness、Answer Relevancy、Context Precision/Recall | 同名指标 + Hallucination、Toxicity、Bias 等 |
+| LLM-as-Judge | 默认 OpenAI，可切换任意 LLM | 同上，支持自定义评估模型 |
+| 集成 | LangChain、LlamaIndex | LangChain、LlamaIndex、Pytest（`deepeval test run`） |
+| 可视化 | 需搭配外部工具 | 内置 Confident AI 云端仪表盘 |
+| 适用场景 | 快速验证 RAG Pipeline | CI/CD 集成、回归测试、多维度综合评估 |
+
+> DeepEval 额外支持 `HallucinationMetric` 幻觉检测
 
 ## LangGraph
 
