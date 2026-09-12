@@ -1,15 +1,15 @@
 # AI
 
-!!! note "AI Agent 层级"
+## AI Agent 层级
 
-    第一层：会不会用LLM
+=== "第一层：会不会用LLM"
 
     - Prompt
     - Structed Output
     - Tool Calling
     - 基本模型能力
 
-    第二层：能不能给 LLM 正确的信息
+=== "第二层：能不能给 LLM 正确的信息"
 
     - RAG
     - Chunk
@@ -18,7 +18,7 @@
     - Rerank
     - Context Management
 
-    第三层：能否控制 LLM 的行为
+=== "第三层：能否控制 LLM 的行为"
 
     - Workflow
     - LangGraph
@@ -28,7 +28,7 @@
     - Planning
     - Tool Selection
 
-    第四层：是否可以把 Agent 接入到真实的世界
+=== "第四层：是否可以把 Agent 接入到真实的世界"
 
     - MCP
     - API
@@ -38,7 +38,7 @@
     - Browser
     - Internal Service
 
-    第五层：Agent 犯错如何处理
+=== "第五层：Agent 犯错如何处理"
 
     - Guardrail
     - Permission
@@ -49,8 +49,8 @@
     - Validation
     - Rollback
 
-    第六层：证明 Agent 的价值
-    
+=== "第六层：证明 Agent 的价值"
+
     - Evaluation
     - Trace
     - Bad Case
@@ -65,46 +65,6 @@
 LLM 擅长语义理解与意图识别，但存在知识时效截止、缺乏确定性计算能力、无法直接操作外部系统等局限。
 
 核心机制：LLM 本身并不直接执行外部代码，而是根据工具定义（Schema）判断调用时机并生成结构化参数（JSON），由宿主程序实际执行工具，再将执行结果（Observation）返回给 LLM 组织最终回答。常见工具如：实时搜索、计算器、数据库查询、业务 API 等。
-
-## Agent 规划模式 
-
-规划模式决定了 Agent 如何把复杂目标拆解为具体行动。常见的主流模式如下：
-
-### 1. ReAct (Reasoning + Acting) - 动态循环规划
-- **核心机制**：`Thought → Action → Observation` 闭环循环。LLM 走一步看一步，根据上一步的执行结果（Observation）动态决定下一步是继续调用工具还是给出最终答复。
-- **适用场景**：探索性、结果不确定、依赖外部反馈的任务（如查阅多层关联资料、排查报错日志）。
-- **工程痛点与解法**：
-  - **容易死循环或早退**：仅靠 LLM 自身判断容易陷入重复调用或幻觉提前终止。
-  - **工程实践**：通常在外部宿主程序中增加 **最大步数限制（Max Steps）**，或引入**状态机/校验器（Validator）**强制进行状态流转判断。
-
-### 2. Plan-and-Execute - 显式拆解规划
-- **核心机制**：两阶段分离。由 Planner 先完整拆解出子任务列表（Step 1...N），再交由 Executor 逐个执行，最后由 Summarizer 汇总。
-- **适用场景**：步骤明确的长链路任务（如“编写某主题的行业调研报告并导出为 PDF”）。
-- **优缺点**：
-  - **优点**：执行成本可控，全局结构清晰，便于展示步骤进度条。
-  - **缺点**：前期规划容易跟不上现实变化。若前置步骤失败，容易引起连锁雪崩（通常需配合 **Plan-and-Solve / 动态重规划 Replanner**）。
-
-### 3. Reflection (Self-Refine) - 反馈式自我演进
-- **核心机制**：`Action → Evaluation → Reflection → Retry`。Agent 产出初步结果后，由专门的 Evaluator/Critic 检查打分，若不合格则输出修改意见，LLM 据此反思并迭代。
-- **适用场景**：有明确评价标准、对准确率要求高的任务（如代码生成、SQL 编写、长文本润色）。
-- **优缺点**：大幅提升单次输出质量，但会带来多倍的延迟（Latency）与 Token 成本消耗。
-
-### 4. Tree of Thoughts (ToT) - 搜索式树状规划
-- **核心机制**：将思考过程建模为树结构，每一步生成多个潜在候选思路（分支），借助 BFS（广度优先）/ DFS（深度优先）或评分机制评估各分支价值，并支持**回溯（Backtracking）**。
-- **适用场景**：需要全局试错与多步博弈的复杂决策（如 24点游戏、数独、策略制定、算法设计）。
-- **优缺点**：推理能力上限最高，但调用次数指数级膨胀，通常限于离线高价值场景。
-
----
-
-### 模式对比与选型指南
-
-| 模式 | 思考时机 | 适应环境变化能力 | Token/延迟成本 | 适用典型场景 |
-| :--- | :--- | :--- | :--- | :--- |
-| **ReAct** | 边走边想 | ⭐⭐⭐⭐⭐（强，随时调整） | 中等 | 动态排错、多跳信息检索 |
-| **Plan-and-Execute** | 想好再走 | ⭐⭐（偏弱，静态为主） | 低 | 结构化流程、标准多步骤任务 |
-| **Reflection** | 做完复盘 | ⭐⭐⭐（中等） | 较高 | 代码/文案生成质量调优 |
-| **Tree of Thoughts** | 穷举推演 | ⭐⭐⭐⭐（支持回溯） | 极高（成倍翻番） | 复杂逻辑推理、算法解题 |
-
 
 ## RAG
 
@@ -237,82 +197,6 @@ Cross-Encoder 是一种精排模型，将 `(query, document)` **拼接为一个�
 
 综合以上策略，工业级 RAG 系统的典型架构为：**Vector + BM25 + Graph 三路并行召回 → RRF 融合 → MMR 去重 → Cross-Encoder 精排**，逐层筛选出最终送入 LLM 的高质量上下文。
 
-### 评估
-
-RAG 系统的评估需要同时衡量**检索质量**和**生成质量**两个维度。当前主流方案采用 **LLM-as-Judge**——用一个 LLM 对另一个 LLM 的输出进行自动化评分，替代人工标注。
-
-#### 核心指标
-
-**检索质量**（评估检索器是否找到了正确且精准的上下文）：
-
-| 指标 | 含义 | 参考阈值 | 低分原因 | 优化方向 |
-|------|------|----------|----------|----------|
-| Context Recall | 检索结果是否**覆盖**了回答所需的全部信息 | 0.8–0.9 | top_k 太小；chunk 太大；Embedding 召回差 | 增大 top_k；缩小 chunk_size；更换 Embedding 模型 |
-| Context Precision | 检索结果中**有多少是真正相关的**（信噪比） | 0.7–0.85 | 召回了大量无关片段 | 增加 Rerank；提高相似度阈值；改善文档质量 |
-
->  Precision 与 Recall 是此消彼长的关系
-
-**生成质量**（评估 LLM 是否基于上下文给出了准确且切题的回答）：
-
-| 指标 | 含义 | 参考阈值 | 低分原因 | 优化方向 |
-|------|------|----------|----------|----------|
-| Faithfulness | 答案是否**忠实于**检索到的上下文（无幻觉） | 0.85–0.95 | System Prompt 约束弱；检索内容不足 | 强化 System Prompt 约束；优先提升 Recall |
-| Answer Relevancy | 答案是否**切题**回答了用户问题 | 0.8–0.9 | Prompt 未引导直接回答；答案冗长绕弯 | Query 重写；优化 Response Prompt |
-
-> **调优优先级**：Recall → Faithfulness → Precision → Relevancy
-> 检索召回是一切的基础——如果相关文档根本没被检索到，后续的精排和生成都无法挽救。
-
-!!! note "MRR（Mean Reciprocal Rank）"
-
-    MRR 衡量的是**第一个正确结果出现的排名位置**，是检索系统常用的评估指标：
-
-    $$\text{MRR} = \frac{1}{|Q|}\sum_{i=1}^{|Q|}\frac{1}{\text{rank}_i}$$
-
-    其中 $\text{rank}_i$ 是第 $i$ 个查询中**首个正确结果的排名**。例如三次查询的首个正确结果分别排在第 1、3、2 位，则 $\text{MRR} = \frac{1}{3}(\frac{1}{1} + \frac{1}{3} + \frac{1}{2}) \approx 0.611$。
-
-    MRR 只关心**第一个**命中的位置，适用于"用户只看第一条结果"的场景（如问答、实体查找）。若需评估整体排序质量，应结合 Precision/Recall 使用。
-
-#### 评估框架：Ragas & DeepEval
-
-| 对比 | Ragas | DeepEval |
-|------|-------|---------|
-| 定位 | 专注 RAG 评估的轻量框架 | 通用 LLM 评估平台（覆盖 RAG + Agent + 对话） |
-| 指标 | Faithfulness、Answer Relevancy、Context Precision/Recall | 同名指标 + Hallucination、Toxicity、Bias 等 |
-| LLM-as-Judge | 默认 OpenAI，可切换任意 LLM | 同上，支持自定义评估模型 |
-| 集成 | LangChain、LlamaIndex | LangChain、LlamaIndex、Pytest（`deepeval test run`） |
-| 可视化 | 需搭配外部工具 | 内置 Confident AI 云端仪表盘 |
-| 适用场景 | 快速验证 RAG Pipeline | CI/CD 集成、回归测试、多维度综合评估 |
-
-> DeepEval 额外支持 `HallucinationMetric` 幻觉检测
-
-#### 生产可观测性：Langfuse
-
-Langfuse 是开源的 LLM 可观测性平台，专注于**生产环境的追踪与监控**，与 Ragas/DeepEval 的离线评估形成互补：
-
-| 能力 | 说明 |
-|------|------|
-| **Tracing** | 端到端追踪每次 LLM 调用链路（检索 → 增强 → 生成），记录输入/输出、耗时、Token 消耗 |
-| **成本监控** | 按模型、用户、会话维度统计 Token 用量与费用 |
-| **在线评估** | 支持接入 LLM-as-Judge 对生产流量实时打分（Faithfulness、Relevancy 等） |
-| **Prompt 管理** | 版本化管理 Prompt 模板，支持 A/B 测试与回滚 |
-| **数据集管理** | 从生产 Trace 中提取 case 构建评测数据集，反哺离线评估 |
-
-**与 Ragas/DeepEval 的协作模式**：
-
-```
-开发阶段                          生产阶段
-┌──────────────────┐            ┌──────────────────┐
-│  Ragas/DeepEval  │            │     Langfuse     │
-│  离线跑评测集      │            │  追踪生产流量      │
-│  验证指标达标      │───上线──→   │  在线评估打分      │
-│                  │            │  发现 bad case    │
-└──────────────────┘            └────────┬─────────┘
-        ▲                                │
-        └────── 提取 case 反哺评测集 ──────┘
-```
-
-> **一句话总结**：Ragas/DeepEval 管"上线前够不够好"，Langfuse 管"上线后跑得怎么样"，两者结合形成评估闭环。
-
 ## 记忆
 
 LLM 本身是无状态的——每次请求都是独立的。Agent 的"记忆"系统负责在多轮对话和跨会话之间**持久化关键信息**，让 Agent 具备上下文连贯性和个性化能力。
@@ -403,6 +287,47 @@ m.add("我们已经从 PostgreSQL 迁移到 MySQL 了", user_id="alice")
 
 > **适用场景**：需要快速为 Agent 集成记忆能力、且不想从零搭建记忆管线（提取→去重→存储→召回）的项目。
 
+## Agent 规划模式 
+
+规划模式决定了 Agent 如何把复杂目标拆解为具体行动。常见的主流模式如下：
+
+### ReAct (Reasoning + Acting) - 动态循环规划
+- **核心机制**：`Thought → Action → Observation` 闭环循环。LLM 走一步看一步，根据上一步的执行结果（Observation）动态决定下一步是继续调用工具还是给出最终答复。
+- **适用场景**：探索性、结果不确定、依赖外部反馈的任务（如查阅多层关联资料、排查报错日志）。
+- **工程痛点与解法**：
+  - **容易死循环或早退**：仅靠 LLM 自身判断容易陷入重复调用或幻觉提前终止。
+  - **工程实践**：通常在外部宿主程序中增加 **最大步数限制（Max Steps）**，或引入**状态机/校验器（Validator）**强制进行状态流转判断。
+
+### Plan-and-Execute - 显式拆解规划
+- **核心机制**：两阶段分离。由 Planner 先完整拆解出子任务列表（Step 1...N），再交由 Executor 逐个执行，最后由 Summarizer 汇总。
+- **适用场景**：步骤明确的长链路任务（如“编写某主题的行业调研报告并导出为 PDF”）。
+- **优缺点**：
+  - **优点**：执行成本可控，全局结构清晰，便于展示步骤进度条。
+  - **缺点**：前期规划容易跟不上现实变化。若前置步骤失败，容易引起连锁雪崩（通常需配合 **Plan-and-Solve / 动态重规划 Replanner**）。
+
+### Reflection (Self-Refine) - 反馈式自我演进
+- **核心机制**：`Action → Evaluation → Reflection → Retry`。Agent 产出初步结果后，由专门的 Evaluator/Critic 检查打分，若不合格则输出修改意见，LLM 据此反思并迭代。
+- **适用场景**：有明确评价标准、对准确率要求高的任务（如代码生成、SQL 编写、长文本润色）。
+- **优缺点**：大幅提升单次输出质量，但会带来多倍的延迟（Latency）与 Token 成本消耗。
+
+### Tree of Thoughts (ToT) - 搜索式树状规划
+- **核心机制**：将思考过程建模为树结构，每一步生成多个潜在候选思路（分支），借助 BFS（广度优先）/ DFS（深度优先）或评分机制评估各分支价值，并支持**回溯（Backtracking）**。
+- **适用场景**：需要全局试错与多步博弈的复杂决策（如 24点游戏、数独、策略制定、算法设计）。
+- **优缺点**：推理能力上限最高，但调用次数指数级膨胀，通常限于离线高价值场景。
+
+---
+
+### 模式对比与选型指南
+
+| 模式 | 思考时机 | 适应环境变化能力 | Token/延迟成本 | 适用典型场景 |
+| :--- | :--- | :--- | :--- | :--- |
+| **ReAct** | 边走边想 | ⭐⭐⭐⭐⭐（强，随时调整） | 中等 | 动态排错、多跳信息检索 |
+| **Plan-and-Execute** | 想好再走 | ⭐⭐（偏弱，静态为主） | 低 | 结构化流程、标准多步骤任务 |
+| **Reflection** | 做完复盘 | ⭐⭐⭐（中等） | 较高 | 代码/文案生成质量调优 |
+| **Tree of Thoughts** | 穷举推演 | ⭐⭐⭐⭐（支持回溯） | 极高（成倍翻番） | 复杂逻辑推理、算法解题 |
+
+## Multi Agent
+
 ## LangGraph
 
 ### 核心概念
@@ -420,10 +345,21 @@ m.add("我们已经从 PostgreSQL 迁移到 MySQL 了", user_id="alice")
 
 human in the loop
 
+## 编排与持久化
 
-### 护栏
+Agent 任务是**分钟级甚至小时级**的，而非毫秒级的普通 RPC 调用，进程重启、模型超时、工具报错都可能发生在任务执行到一半时。因此长链路 Agent 需要一层持久化编排（如 Temporal），提供状态持久化、失败重试、任务队列与定时器等能力，让任务可以从中断处恢复而不是从头重跑。
 
-#### PII 
+> LangGraph 解决的是**单次运行内**的流程编排，Temporal 解决的是**跨进程、跨重启**的任务可靠性，两者互补。
+
+## MCP
+
+## Harness
+
+### Hermes
+
+## 护栏
+
+### PII 
 脱敏身份证号、手机号、邮箱、信用卡号等敏感信息
 
 处理策略
@@ -442,16 +378,83 @@ After Agent 输出安全
 
 可以有基于规则和LLM语义分析的两种护栏模式，前者更快、更便宜，但容易被绕过，后者更全面，但更贵、更慢
 
-## Hermes
+## 评估
 
+RAG 系统的评估需要同时衡量**检索质量**和**生成质量**两个维度。当前主流方案采用 **LLM-as-Judge**——用一个 LLM 对另一个 LLM 的输出进行自动化评分，替代人工标注。
 
+### 核心指标
 
-## Harness
+**检索质量**（评估检索器是否找到了正确且精准的上下文）：
 
+| 指标 | 含义 | 参考阈值 | 低分原因 | 优化方向 |
+|------|------|----------|----------|----------|
+| Context Recall | 检索结果是否**覆盖**了回答所需的全部信息 | 0.8–0.9 | top_k 太小；chunk 太大；Embedding 召回差 | 增大 top_k；缩小 chunk_size；更换 Embedding 模型 |
+| Context Precision | 检索结果中**有多少是真正相关的**（信噪比） | 0.7–0.85 | 召回了大量无关片段 | 增加 Rerank；提高相似度阈值；改善文档质量 |
 
+>  Precision 与 Recall 是此消彼长的关系
 
-## MCP
+**生成质量**（评估 LLM 是否基于上下文给出了准确且切题的回答）：
 
+| 指标 | 含义 | 参考阈值 | 低分原因 | 优化方向 |
+|------|------|----------|----------|----------|
+| Faithfulness | 答案是否**忠实于**检索到的上下文（无幻觉） | 0.85–0.95 | System Prompt 约束弱；检索内容不足 | 强化 System Prompt 约束；优先提升 Recall |
+| Answer Relevancy | 答案是否**切题**回答了用户问题 | 0.8–0.9 | Prompt 未引导直接回答；答案冗长绕弯 | Query 重写；优化 Response Prompt |
+
+> **调优优先级**：Recall → Faithfulness → Precision → Relevancy
+> 检索召回是一切的基础——如果相关文档根本没被检索到，后续的精排和生成都无法挽救。
+
+!!! note "MRR（Mean Reciprocal Rank）"
+
+    MRR 衡量的是**第一个正确结果出现的排名位置**，是检索系统常用的评估指标：
+
+    $$\text{MRR} = \frac{1}{|Q|}\sum_{i=1}^{|Q|}\frac{1}{\text{rank}_i}$$
+
+    其中 $\text{rank}_i$ 是第 $i$ 个查询中**首个正确结果的排名**。例如三次查询的首个正确结果分别排在第 1、3、2 位，则 $\text{MRR} = \frac{1}{3}(\frac{1}{1} + \frac{1}{3} + \frac{1}{2}) \approx 0.611$。
+
+    MRR 只关心**第一个**命中的位置，适用于"用户只看第一条结果"的场景（如问答、实体查找）。若需评估整体排序质量，应结合 Precision/Recall 使用。
+
+### 评估框架：Ragas & DeepEval
+
+| 对比 | Ragas | DeepEval |
+|------|-------|---------|
+| 定位 | 专注 RAG 评估的轻量框架 | 通用 LLM 评估平台（覆盖 RAG + Agent + 对话） |
+| 指标 | Faithfulness、Answer Relevancy、Context Precision/Recall | 同名指标 + Hallucination、Toxicity、Bias 等 |
+| LLM-as-Judge | 默认 OpenAI，可切换任意 LLM | 同上，支持自定义评估模型 |
+| 集成 | LangChain、LlamaIndex | LangChain、LlamaIndex、Pytest（`deepeval test run`） |
+| 可视化 | 需搭配外部工具 | 内置 Confident AI 云端仪表盘 |
+| 适用场景 | 快速验证 RAG Pipeline | CI/CD 集成、回归测试、多维度综合评估 |
+
+> DeepEval 额外支持 `HallucinationMetric` 幻觉检测
+
+### 生产可观测性：Langfuse
+
+Langfuse 是开源的 LLM 可观测性平台，专注于**生产环境的追踪与监控**，与 Ragas/DeepEval 的离线评估形成互补：
+
+| 能力 | 说明 |
+|------|------|
+| **Tracing** | 端到端追踪每次 LLM 调用链路（检索 → 增强 → 生成），记录输入/输出、耗时、Token 消耗 |
+| **成本监控** | 按模型、用户、会话维度统计 Token 用量与费用 |
+| **在线评估** | 支持接入 LLM-as-Judge 对生产流量实时打分（Faithfulness、Relevancy 等） |
+| **Prompt 管理** | 版本化管理 Prompt 模板，支持 A/B 测试与回滚 |
+| **数据集管理** | 从生产 Trace 中提取 case 构建评测数据集，反哺离线评估 |
+
+**与 Ragas/DeepEval 的协作模式**：
+
+```
+开发阶段                          生产阶段
+┌──────────────────┐            ┌──────────────────┐
+│  Ragas/DeepEval  │            │     Langfuse     │
+│  离线跑评测集      │            │  追踪生产流量      │
+│  验证指标达标      │───上线──→   │  在线评估打分      │
+│                  │            │  发现 bad case    │
+└──────────────────┘            └────────┬─────────┘
+        ▲                                │
+        └────── 提取 case 反哺评测集 ──────┘
+```
+
+> **一句话总结**：Ragas/DeepEval 管"上线前够不够好"，Langfuse 管"上线后跑得怎么样"，两者结合形成评估闭环。
+
+## 模型路由
 
 ## Cache 命中
 降低token成本：
@@ -464,5 +467,3 @@ After Agent 输出安全
 ## Gateway
 
 业界常用Portkey AI Gateway，可提供统一路由、虚拟key预算、fallback和跨供应商成本跟踪等。
-
-agent任务是分钟级而非毫秒级，因此应该用Temporal等工具支持状态的持久化、重试、任务队列与定时器等功能
