@@ -328,6 +328,77 @@ m.add("我们已经从 PostgreSQL 迁移到 MySQL 了", user_id="alice")
 
 ## Multi Agent
 
+### 3种模式
+
+=== "Pipeline"
+
+    ```
+    请求
+    │
+    ▼
+    [Retriever] ──▶ [Reranker] ──▶ [Generator] ──▶ [Verifier] ──▶ 响应
+    ```
+
+=== "Hub and Spoke"
+
+    ```
+                    ┌─── Retriever ──┐
+                    │                │
+    用户 ──▶ Orchestrator ─── Reranker ───▶ 合成回复
+                    │                │
+                    └─── Generator ──┘
+    ```
+
+=== "Blackboard"
+
+    ```
+            写入              读取
+    Agent A ──────▶ Blackboard ◀────── Agent C
+    Agent B ──────▶     │     ◀────── Agent D
+                        │
+                变更通知（事件）
+    ```
+
+3 种模式的对比：
+
+| 维度 | Pipeline | Hub-and-Spoke | Blackboard |
+|------|----------|---------------|------------|
+| 复杂度 | 低 | 中 | 高 |
+| 调试难度 | 易 | 中 | 难 |
+| 并行能力 | 低 | 高 | 高 |
+| 适合任务 | 线性 | 多角色协作 | 迭代协商 |
+| 典型实现 | Redis Queue | FastAPI + gRPC | DB + Pub-Sub |
+
+### 通信机制
+
+| 机制 | 代表技术 | 延迟 | 耦合度 | 适用场景 |
+|------|----------|------|--------|----------|
+| **Sync RPC** | HTTP / gRPC | 低 | 高 | 实时决策、简单编排 |
+| **Async Queue** | Redis / Kafka / SQS | 中 | 低 | 耗时操作、高并发 |
+| **Pub-Sub** | SNS / Kafka Topic | 中 | 很低 | 广播事件、多订阅方 |
+| **Shared Storage** | S3 + DB + 信号 | 高 | 很低 | 大文件、artifacts 共享 |
+
+### 优雅降级
+
+**场景**：Reranker 服务不可用时，系统不应整体崩溃，而应**降级**继续提供服务。
+
+```
+正常路径：  retrieve → rerank → generate  ✅
+降级路径1： retrieve → (skip rerank) → generate  ⚠️ 质量略降
+降级路径2： (retrieve timeout) → return cached snippets  ⚠️ 更大降级
+兜底路径：  return static fallback message  🆘
+```
+
+### 三条铁律
+
+1. **每条消息带 `request_id`**，处理前先做幂等检查
+2. **每个 Agent 暴露 latency + status**，不监控等于盲飞
+3. **提前设计失败路径**，不要等故障发生后再想降级逻辑
+
+### 常用框架
+
+Microsoft Agent Framework/AutoGen 与 CrewAI
+
 ## LangGraph
 
 ### 核心概念
@@ -466,4 +537,6 @@ Langfuse 是开源的 LLM 可观测性平台，专注于**生产环境的追踪�
 
 ## Gateway
 
+LiteLLM
 业界常用Portkey AI Gateway，可提供统一路由、虚拟key预算、fallback和跨供应商成本跟踪等。
+
