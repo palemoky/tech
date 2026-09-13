@@ -73,6 +73,7 @@ RAG 的完整流程可分为**离线索引**与**在线推理**两个阶段：
 **离线索引**：解析、清洗文档 → 分块（Chunking） → 通过 Embedding 模型向量化 → 存入向量数据库。
 
 **在线推理**：
+
 1. **检索 (Retrieval)**：根据用户问题，从向量数据库中检索语义最相关的 top-K 候选文档片段。
 2. **增强 (Augmentation)**：将检索到的文档片段与用户问题组合，构建扩展上下文（Context），作为 Prompt 一并送入 LLM。
 3. **生成 (Generation)**：LLM 基于扩展上下文进行回答，确保答案的准确性和可追溯性。
@@ -508,9 +509,76 @@ Agent 任务是**分钟级甚至小时级**的，而非毫秒级的普通 RPC �
 
 ## MCP
 
+MCP（Model Context Protocol）是 Anthropic 提出的开放协议，用于标准化 LLM 应用与外部工具、数据源之间的连接方式，可以理解为 AI 应用的 "USB-C 接口"。
+
+**解决的问题**：没有统一协议时，M 个 AI 应用对接 N 个工具需要 M×N 份适配代码；有了 MCP，工具只需实现一次 MCP Server，就能被所有支持 MCP 的应用复用，复杂度降为 M+N。
+
+> Tool Call 是模型层面"如何调用工具"的能力，MCP 是工程层面"工具如何被发现和接入"的协议，MCP 底层仍然依赖模型的 Tool Call 能力
+
+### 架构
+
+```
+┌──────────────── Host（Claude Desktop / IDE / Agent）────────────────┐
+│   MCP Client ①          MCP Client ②          MCP Client ③          │
+└───────┬──────────────────────┬─────────────────────┬────────────────┘
+        │ 1:1                  │ 1:1                 │ 1:1
+   MCP Server             MCP Server            MCP Server
+   (GitHub)               (数据库)               (文件系统)
+```
+
+- **Host**：用户直接使用的 AI 应用，管理多个 Client
+- **Client**：Host 内部与某个 Server 保持 1:1 连接的组件
+- **Server**：对外暴露能力的轻量服务，封装具体的工具或数据源
+
+通信基于 **JSON-RPC 2.0**，传输方式有两种：
+
+| 传输方式 | 场景 |
+|---|---|
+| stdio | Server 作为本地子进程运行，适合访问本地文件、命令行工具 |
+| Streamable HTTP | Server 远程部署，支持多客户端，远程场景需做鉴权（OAuth） |
+
+### 核心能力
+
+| 能力 | 提供方 | 控制方 | 说明 |
+|---|---|---|---|
+| Tools | Server | 模型决定调用 | 可执行的操作，如查询数据库、创建 Issue |
+| Resources | Server | 应用决定加载 | 只读的上下文数据，如文件内容、数据库 Schema |
+| Prompts | Server | 用户主动选择 | 预定义的提示词模板 |
+| Sampling | Client | Server 发起 | Server 反过来请求 Host 的模型生成内容 |
+| Elicitation | Client | Server 发起 | Server 在执行中向用户追问信息 |
+
+### 注意事项
+
+- **上下文膨胀**：每个 Tool 的定义都会占用上下文，接入过多 Server 会挤占 Token 并降低工具选择的准确率，应按需加载
+- **安全风险**：第三方 Server 可能在工具描述或返回结果中植入恶意指令（工具投毒 / 间接 Prompt 注入），接入前需审查来源并控制权限（参见[护栏](#护栏)）
+
 ## Harness
 
-### Hermes
+**Agent = Model + Harness**。Harness 指模型之外的整套运行时"脚手架"，负责把一个只会生成文本的 LLM 变成能持续完成任务的 Agent。同一个模型放在不同的 Harness 里，实际效果可能差距很大。
+
+Harness 通常包含：
+
+| 组件 | 职责 |
+|---|---|
+| Agent Loop | 驱动 "思考 → 调用工具 → 观察结果" 的循环，决定何时结束 |
+| 工具系统 | 内置工具（读写文件、执行命令、搜索）+ MCP 扩展 |
+| 上下文管理 | 组织 System Prompt、压缩历史、控制 Token 预算（参见[成本优化](#成本优化)） |
+| 记忆 | 跨会话持久化用户偏好与项目知识（参见[记忆](#记忆)） |
+| 权限与沙箱 | 限制可执行的操作，高风险操作需要确认（参见[护栏](#护栏)） |
+| 扩展机制 | Skills、Hooks、Sub-Agent 等 |
+
+> 与 LangGraph 这类框架的区别：框架提供搭建 Agent 的积木，需要自己组装流程；Harness 是开箱即用的完整运行时，典型代表有 Claude Code、Codex CLI、Hermes Agent
+
+### Hermes Agent
+
+Nous Research 于 2026 年 2 月开源的 Agent Harness，与该团队的 Hermes 系列模型同名但不是一回事。它与模型无关，可接入各类闭源和开源模型，定位是长期运行的个人助手。
+
+主要特点：
+
+- **自我进化的 Skills**：从成功完成的任务轨迹中自动沉淀 Skill，并在后续使用中持续改进
+- **持久记忆**：跨会话记住用户相关的事实，并可检索自己过去的对话
+- **多平台接入**：通过消息网关连接 Telegram、Discord、Slack 等
+- **对开源模型友好**：官方主打的卖点之一是更适合搭配开源模型使用
 
 ## 护栏
 
