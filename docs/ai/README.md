@@ -401,20 +401,104 @@ Microsoft Agent Framework/AutoGen 与 CrewAI
 
 ## LangGraph
 
+LangGraph 是 LangChain 团队推出的**底层 Agent 编排框架**，把 Agent 的执行过程建模为一张**有状态的图**。与 LangChain 早期的 Chain（线性 DAG）不同，LangGraph 的核心卖点是**支持循环**——这正是 ReAct 这类「思考 → 调工具 → 观察 → 再思考」模式所需要的。
+
 ### 核心概念
 
-|概念|含义|代码实现|
-|---|---|
-|State|工作流中的数据状态|Dict["str", Any]|
-|Node|可复用的节点|Runnable（Prompt，Model，Chain，Custom Runnable 等）|
-|Edge|节点之间的连接|ConditionalEdge、SimpleEdge、DirectEdge 等|
-|Graph|由节点和边组成的有向无环图（DAG）|Graph|
+| 概念 | 含义 | 代码实现 |
+|---|---|---|
+| State | 在节点间共享、流转的数据状态，是图的「内存」 | `TypedDict` / Pydantic `BaseModel`，字段可用 `Annotated[..., reducer]` 指定合并方式 |
+| Node | 执行一步具体工作（调模型、调工具、业务逻辑） | 普通函数 `(state) -> dict`，返回的是**状态的增量更新**而非完整状态 |
+| Edge | 决定下一步执行哪个节点 | `add_edge`（固定边）、`add_conditional_edges`（条件边）、`START` / `END` 虚拟节点 |
+| Reducer | 多个节点写同一字段时如何合并 | 默认覆盖；`operator.add` 追加；`add_messages` 按消息 ID 追加/更新 |
+| Graph | 由节点和边组成的**有向图（允许有环）** | `StateGraph(State)` → `.compile()` 得到可执行的 `CompiledGraph` |
+| Checkpointer | 每步执行后保存状态快照，是记忆、中断、恢复的基础 | `InMemorySaver`、`SqliteSaver`、`PostgresSaver`，按 `thread_id` 隔离会话 |
+
+最小示例：
+
+```python
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]  # 追加而非覆盖
+
+def chatbot(state: State):
+    return {"messages": [llm.invoke(state["messages"])]}  # 只返回增量
+
+builder = StateGraph(State)
+builder.add_node("chatbot", chatbot)
+builder.add_edge(START, "chatbot")
+builder.add_edge("chatbot", END)
+
+graph = builder.compile(checkpointer=InMemorySaver())
+graph.invoke({"messages": [("user", "hi")]}, {"configurable": {"thread_id": "1"}})
+```
 
 ### 控制流
 
+| 方式 | 作用 | 典型场景 |
+|---|---|---|
+| **固定边** `add_edge(a, b)` | a 执行完必然走 b | 线性流水线 |
+| **条件边** `add_conditional_edges(a, router)` | 根据 `router(state)` 的返回值选择下一个节点 | 判断是否需要调工具、意图路由 |
+| **循环** | 条件边指回之前的节点 | ReAct：`agent → tools → agent`，直到不再调工具才走 `END` |
+| **并行（扇出/扇入）** | 一个节点连多条边，下游节点在同一步并发执行，结果经 reducer 合并 | 多路检索、多角度分析 |
+| **`Send`（Map-Reduce）** | 在运行时动态决定分发几个并行任务，每个任务携带独立输入 | 对 N 篇文档各生成摘要后汇总 |
+| **`Command`** | 节点内同时完成「更新状态 + 跳转」，无需预先声明条件边 | Multi-Agent 之间的 handoff |
+| **子图（Subgraph）** | 把一张编译好的图当作另一张图的节点 | 模块化复用、Multi Agent 分层 |
+
+ReAct 循环的典型写法：
+
+```python
+from langgraph.prebuilt import ToolNode, tools_condition
+
+builder.add_node("agent", call_model)
+builder.add_node("tools", ToolNode(tools))
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)  # 有 tool_calls → "tools"，否则 → END
+builder.add_edge("tools", "agent")                       # 形成循环
+```
+
+> 防止死循环：调用时传 `{"recursion_limit": 25}`，超过步数会抛出 `GraphRecursionError`。
+
 ### 中断
 
-human in the loop
+中断是 LangGraph 实现 **Human in the Loop** 的机制：图执行到某处暂停，把状态持久化到 Checkpointer，等待人工输入后再从断点继续。**必须配置 Checkpointer 和 `thread_id`**，否则无法恢复。
+
+两种方式：
+
+| 方式 | 写法 | 特点 |
+|---|---|---|
+| **动态中断**（推荐） | 节点内调用 `interrupt(payload)` | 可以按条件中断，并把上下文信息抛给前端 |
+| **静态断点** | `compile(interrupt_before=["tools"])` / `interrupt_after` | 在指定节点前/后固定暂停，多用于调试 |
+
+```python
+from langgraph.types import interrupt, Command
+
+def human_review(state: State):
+    decision = interrupt({"question": "是否执行该操作？", "tool_call": state["tool_call"]})
+    if decision == "approve":
+        return Command(goto="execute")
+    return Command(goto=END)
+
+config = {"configurable": {"thread_id": "order-42"}}
+graph.invoke(inputs, config)                 # 执行到 interrupt 处暂停，返回 __interrupt__ 信息
+graph.invoke(Command(resume="approve"), config)  # 带着人工决定恢复执行
+```
+
+常见 HITL 模式：
+
+- **审批**：高风险工具调用（转账、删库、发邮件）前要求人工确认
+- **编辑状态**：人工修改模型生成的草稿/参数后再继续
+- **补充信息**：Agent 缺少关键参数时向用户追问
+
+注意事项：
+
+- 恢复时**节点会从头重新执行**（而非从 `interrupt()` 那一行继续），所以 `interrupt()` 之前的代码要保证幂等，副作用操作放到中断之后
+- 同一节点内有多个 `interrupt()` 时按调用顺序匹配 resume 值，不要把它放在顺序不固定的逻辑里
+- 借助 Checkpointer 还能做**时间旅行**：`get_state_history()` 查看历史快照，从任意 checkpoint 分叉重跑
 
 ## 编排与持久化
 
