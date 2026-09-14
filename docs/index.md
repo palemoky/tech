@@ -12,6 +12,7 @@ description: 思考、总结、沉淀
 | 答非所问     | 先确认问题，停顿思考再作答。如果没有理解问题，可以复述后，询问面试官确认问题                                           |
 | 回答问题遗漏 | 有条件的话用纸笔记录问题，没有条件的话先记住123个问题，不要着急想答案，然后根据123分别作答，如果有遗忘，询问面试官问题 |
 | 回答啰唆     | 先说结论，然后再拆解为123说原因或具体行动                                                                              |
+| 无法捕获问题的关键字，提示时没用到提示信息 | 确认问题时整理关键字，收到提示时要先按照提示的思路方向考虑 |
 
 ## 自我介绍
 
@@ -149,6 +150,15 @@ GC 会在内存达到阈值和超过2分钟没有GC时被触发。在实际的�
 
 ## AI
 
+### 如何使用AI提效？
+1. 自己先准确理解需求，将需求拆分为多个小的任务，降低AI幻觉
+2. 在每个SKILL中补充工具和业务术语等上下文信息，并增加约束
+3. 自己先设计一下实现方案，然后与AI讨论完善方案
+4. 交由AI编写代码，并在编写过程中通过单元测试来保证质量
+5. 针对关键模块，会使用不同的AI模型进行交叉验证
+6. 上线前人工review代码，避免AI编写的代码成为黑盒
+7. 每次编写时，都会及时对项目进行重构，保持模块边界清晰，降低耦合，增加可维护性
+
 ### 如何解决长对话摘要丢失关键信息？
 
 单纯全局摘要很容易丢失用户早期核心需求、硬性偏好这类关键信息，我会四层机制组合规避：
@@ -158,11 +168,156 @@ GC 会在内存达到阈值和超过2分钟没有GC时被触发。在实际的�
 3. 底层搭配RAG语义检索向量库，摘要只做提纲，完整原始对话永久存储，遗漏细节可随时召回原文；
 4. 针对超长会话、大量工具返回的复杂场景，上 Multi-Agent Memory：主对话 Agent 只负责交互，Observer / Reflector / Retriever 专职写记忆、评优先级、按需召回，用分工替代全文压缩，从架构上避免关键信息丢失与上下文膨胀。
 
-### 使用流程
+### 同一个问题的两次输出不一致
+LLM是概率生成，因此相同的输入有不同的输出是正常现象，可以通过工程手段确保**业务结果稳定**，如
+- 使用 JSON 结构化输出
+- 对输出字段与格式校验，不符合要求时自动重试，多次失败降级到规则系统或人工
+- 通过prompt或temperature降低随机性
+- 输出在某个阈值内即可
+
+### 模型的升级与下线如何确保agent的稳定？
+
+通过可观测系统评估模型的可用性与稳定性，出现故障时及时路由或降级。
 
 ## Kubernetes
 
-各个组件的作用，核心组件的工作流程和原理
+### 1. 核心架构与组件职责
+
+K8s 整体采用 **Master（控制面 Control Plane）- Worker（工作节点 Node）** 架构，核心通信模式是所有组件均通过 **kube-apiserver** 交互，组件之间不直接通信，数据统一由 **etcd** 持久化。
+
+| 节点类型 | 组件名称 | 核心职责与原理 | 面试高频关注点 |
+| :--- | :--- | :--- | :--- |
+| **Control Plane** | **kube-apiserver** | 集群唯一入口，暴露 RESTful API，负责认证（AuthN）、鉴权（AuthZ）、准入控制（Admission Control），管理 etcd 读写 | 无状态设计，可水平扩展；唯一能直接读写 etcd 的组件 |
+| | **etcd** | 高可用强一致性键值存储（基于 Raft 协议），存储集群所有资源的状态元数据 | 仅控制面组件；写请求需多数派节点确认；需注意心跳、磁盘 IOPS 及存储上限（默认 2GB，可调至 8GB） |
+| | **kube-scheduler** | 调度器，监听未绑定的 Pod，根据节点资源状况将其分配给最合适的 Node | **两阶段调度**：**Predicates（预选过滤）** 剔除不合规节点 -> **Priorities（优选打分）** 选出最高分节点 |
+| | **kube-controller-manager** | 控制器管理器，运行一系列后台控制循环（Reconciliation Loop，期望状态 vs 实际状态） | 包含 DeploymentController、NodeController、EndpointController 等，体现“声明式设计”的核心驱动力 |
+| **Worker Node** | **kubelet** | 节点“带头人”，接收 apiserver 指令，通过 CRI/CNI/CSI 维护本节点 Pod 的完整生命周期与上报状态 | 负责拉镜像、起容器、执行探针（Liveness/Readiness）、监控资源消耗 |
+| | **kube-proxy** | 节点网络代理，维护本节点的网络规则，实现 **Service 的虚拟 IP（ClusterIP）到 Pod IP 的负载均衡与转发** | 支持 **iptables** 和 **IPVS** 两种模式，控制面由其维护节点转发规则 |
+| | **Container Runtime** | 容器运行时（如 containerd、CRI-O），遵循 CRI 标准，真正负责下载镜像并启动/停止容器 | 通过 pause 容器（Infra 容器）初始化网络命名空间和 IPC，供业务容器共享 |
+
+### 2. 核心工作流程：从 `kubectl run/apply` 到 Pod 运行全流程
+
+> 面试高频题：“在终端敲下 `kubectl apply -f pod.yaml` 后，K8s 内部到底发生了什么？”
+
+1. **请求校验与入库（apiserver）**：
+   - kubectl 向 `apiserver` 发送 HTTP POST/PUT 请求；
+   - apiserver 依次进行：**认证（身份）** -> **鉴权（RBAC 权限）** -> **准入控制器（Mutating/Validating Webhook，参数补全与合规校验）**；
+   - 校验通过后，将 Pod 对象的元数据写入 `etcd`，此时 Pod 处于 `Pending` 状态（`NodeName` 为空）。
+2. **控制器监听（controller-manager）**：
+   - 对应控制器（如 DeploymentController）通过 List-Watch 机制感知到新资源，生成对应的 ReplicaSet 及底层 Pod 规范对象。
+3. **调度决策（kube-scheduler）**：
+   - scheduler 通过 List-Watch 发现新创建且未分配节点的 Pod；
+   - 执行**预选算法（Filtering）**：检查节点资源容量（CPU/内存）、亲和性（NodeAffinity）、污点与容忍度（Taints/Tolerations）等；
+   - 执行**优选算法（Scoring）**：计算多维度得分（如资源均匀分布、镜像已拉取等），选出最高分 Node；
+   - scheduler 将绑定关系封装为 `Binding` 对象，提交给 apiserver 写入 etcd（将 Pod 的 `spec.nodeName` 赋值）。
+4. **节点拉起（kubelet）**：
+   - 目标 Node 上的 `kubelet` 通过 Watch 机制发现该 Pod 已调度到本节点；
+   - kubelet 调用 **CRI（如 containerd）**：
+     1. 首先创建 **Pause 容器（Infra Container）**，分配该 Pod 专属的网络 Namespace 和 IPC；
+     2. 调用 **CNI（容器网络接口，如 Calico/Flannel）** 为 Pause 容器分配 Pod IP 并打通宿主机网桥；
+     3. 调用 **CSI（容器存储接口）** 挂载卷（Volume）；
+     4. 拉取业务镜像，启动业务容器并加入 Pause 容器的网络栈（共享网络与端口）；
+5. **探针与状态就绪（kubelet -> apiserver）**：
+   - 容器启动后，kubelet 执行启动探针和就绪探针；探针通过后将状态置为 `Running`，kubelet 向 apiserver 上报最新状态，同步写入 etcd。
+
+### 3. 服务注册与服务发现原理
+
+后端微服务在容器化后，Pod 的 IP 是动态变化的（漂移、扩缩容、故障自愈），K8s 通过 **Service + EndpointSlice + CoreDNS + kube-proxy** 实现了去中心化的原生服务注册与发现。
+
+```
+Client Pod
+    │
+    ▼ (1. 发起请求: http://user-service:8080)
+CoreDNS ──(2. 解析为 ClusterIP: 10.96.0.10)
+    │
+    ▼ (3. 流量到达 Linux 内核网络栈)
+kube-proxy 维护的 iptables/IPVS 规则 ──(4. DNAT 转换 / 负载均衡)──► 真实目标 Pod IP (10.244.1.15)
+```
+
+#### 1) 服务注册（Service 如何与 Pod 关联？）
+- **Label Selector 匹配**：用户创建 Service 时指定 `selector` 标签，匹配对应的后端 Pod。
+- **EndpointController 动态追踪**：
+  - K8s 内核的 `EndpointController` 不间断监听 Pod 的创建、销毁与就绪状态；
+  - 只有**就绪探针（ReadinessProbe）检查通过**的 Pod，其 IP:Port 才会被加入到对应 Service 的 `Endpoints`（或新版 `EndpointSlice`）列表中；若 Pod 异常或退出，自动从列表中剔除。
+  - **EndpointSlice 优化**：早期的 Endpoints 对象在一个大 List 中存储所有 Pod，成百上千 Pod 规模下哪怕变更一个 Pod 都会触发全量广播与节点刷新，造成网络暴风；`EndpointSlice` 将其切片分段（默认 100 个一组），极大降低了大型集群的控制面开销。
+
+#### 2) 服务发现与流量转发（两层协作）
+1. **控制面 / 名字解析（CoreDNS）**：
+   - K8s 集群内内置 CoreDNS 服务，作为集群内默认 DNS 递归服务器。
+   - 每个 Pod 的 `/etc/resolv.conf` 默认配置了 CoreDNS 的 ClusterIP。
+   - 当调用跨服务短域名 `user-service` 时，DNS 自动按搜索域（`names.svc.cluster.local`）补全完整 FQDN，解析并返回该 Service 的 **ClusterIP（VIP）**。
+2. **数据面 / 负载转发（kube-proxy）**：
+   - **ClusterIP 本质上是一个虚拟 IP**，并不挂载在宿主机的任何物理或虚拟网卡上，无法直接 ping 通；
+   - 宿主机上的 `kube-proxy` 监听 Service 和 EndpointSlice 的变化，并在宿主机内核网络栈维护转发规则：
+     - **iptables 模式**：
+       - 利用 Linux netfilter 的 PREROUTING 和 OUTPUT 链进行 **DNAT（目标地址转换）**；
+       - 通过随机概率匹配（`statistic --mode random`）模拟轮询转发；
+       - **缺点**：iptables 规则是线性遍历（复杂度 $O(n)$），当集群 Service 数量超过数千时，规则链条过长，网络吞吐急剧下降，且刷新规则有内核锁竞争。
+     - **IPVS 模式（生产高并发推荐）**：
+       - 基于内核 IPVS（LVS）模块，使用**哈希表（Hash Table）**存储路由规则，查询复杂度为 $O(1)$；
+       - 支持真实丰富的负载均衡算法（Round-Robin、加权轮询、最小连接数等）；
+       - 高并发下连接建立延迟更低、吞吐更高、资源消耗更平稳。
+
+#### 3) Headless Service（无头服务）
+- **定义**：配置 `clusterIP: None` 的 Service。
+- **原理**：不分配 ClusterIP，kube-proxy 也不生成任何转发规则；CoreDNS 解析该域名时，**直接返回后端所有健康 Pod 的真实 IP 列表（A 记录）**。
+- **适用场景**：
+  - **有状态服务（StatefulSet）**：如 MySQL 主从、Kafka、ZooKeeper、Elasticsearch 集群，客户端需要感知具体节点身份与角色，进行点对点特定路由或自建客户端负载均衡。
+
+### 4. Pod 生命周期与零停机（平滑升级与优雅停机）
+
+在后端微服务发布更新时，如果处理不当，极易发生 `502 Bad Gateway` 或 `Connection Reset by Peer`。
+
+#### 1) 三类健康检查探针（Probes）
+- **StartupProbe（启动探针）**：
+  - **作用**：判断容器是否已启动成功。在 StartupProbe 成功之前，Liveness 和 Readiness 探针均不会启动。
+  - **场景**：解决 Java/JVM 等冷启动很慢的胖应用在启动过程中就被 Liveness 误杀的问题。
+- **LivenessProbe（存活探针）**：
+  - **作用**：判断容器是否存活。如果探测失败达到阈值，kubelet 会依据重启策略**杀掉并重启该容器**。
+  - **场景**：解决服务陷入死锁、死循环假死等容器未退出但无法对外提供响应的场景。
+- **ReadinessProbe（就绪探针）**：
+  - **作用**：判断容器是否已经准备好接收流量。若探测失败，不会重启容器，而是**将其从 Service 的 Endpoints 列表中暂时剔除**，不再接收新流量。
+  - **场景**：服务热身、加载大缓存或瞬时依赖抖动，待就绪后自动重新接流。
+
+#### 2) 为什么发布时会出现流量抖动（502）？
+- **根因分析**：
+  - 当 Deployment 进行滚动更新触发 Pod 销毁时，**应用接收 `SIGTERM` 信号准备退出** 与 **K8s 控制面将该 Pod IP 从 Service/Endpoints 中摘除** 这两个流程是**异步并发**执行的！
+  - 若应用收到 `SIGTERM` 立即结束进程，但此时局部 Node 的 kube-proxy 尚未完全刷掉该 Pod 的转发规则，新进入的请求依然会路由到已关闭的容器，导致连接重置（Connection Refused/502）。
+
+#### 3) 生产环境平滑发布黄金组合
+1. **配置 `preStop` 延迟脚本**：
+   - 在容器 lifecycle 中配置 `preStop: exec: command: ["sleep", "15"]`；
+   - 强制容器在收到 `SIGTERM` 前先休眠 10~15 秒，确保所有工作节点的 iptables/IPVS 规则以及 Ingress/网关都已完全摘除该 Pod。
+2. **应用层支持优雅停机（Graceful Shutdown）**：
+   - 捕获 `SIGTERM` 信号后，停止接收新请求，处理完在途现存请求并关闭数据库连接池等外部资源后再退出。
+3. **设置足够的停机等待时间**：
+   - 确保 `terminationGracePeriodSeconds`（默认 30s）大于 `preStop sleep 时间 + 业务在途最长处理时间`。
+
+### 5. 资源管理与 QoS 调度等级
+
+#### 1) Requests vs Limits
+- **`requests`（资源请求）**：
+  - 调度阶段依据：kube-scheduler 仅根据节点的 **剩余未分配 requests 资源** 决定 Pod 是否能调度上去，而不是根据当前节点实际的实时消耗。
+- **`limits`（资源上限）**：
+  - 运行时控制：通过 Linux 底层 `cgroups` 强制约束容器的最大资源开销。
+  - **CPU 是可压缩资源**：当容器 CPU 超出 limits，不会被杀死，而是被 Linux CFS 限流（Throttling），导致响应耗时显著升高。
+  - **Memory 是不可压缩资源**：当容器内存超出 limits，直接触发操作系统内核 OOM，被系统强制杀死（状态变为 `OOMKilled`，容器退出码为 `137`）。
+
+#### 2) QoS（服务质量等级）与节点驱逐（Eviction）
+当 Node 节点内存或磁盘耗尽时，kubelet 会按 QoS 优先级从低到高驱逐 Pod：
+1. **BestEffort（最低优先）**：Pod 内所有容器均未设置 requests 和 limits。节点资源紧缺时最先被杀死/驱逐。
+2. **Burstable（弹性伸缩）**：Pod 内容器设置了 requests，且 requests < limits。允许适度超卖，在 BestEffort 驱逐完后若仍吃紧则被驱逐。
+3. **Guaranteed（最高保障）**：Pod 内所有容器的 CPU 和 Memory 都显式配置了 requests 且 requests == limits。调度优先级最高，最后才会被考虑驱逐（生产关键核心业务标配）。
+
+### 6. 服务暴露与网关入口对比
+
+| 暴露方式 | 层级 | 核心工作原理 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| **ClusterIP** | L4 | 分配集群内部专用的虚拟 IP，只能在集群内部访问 | 微服务内部 RPC/HTTP 相互调用 |
+| **NodePort** | L4 | 在每个 Node 节点上开放相同的静态端口（默认范围 30000-32767），请求到达任意 Node:NodePort 均被转发至后端 Pod | 线下测试、临时外通；缺点是占用宿主机端口、无法收敛管理 |
+| **LoadBalancer** | L4 | 结合公有云厂商（AWS ELB、阿里云 SLB 等），自动申请云上外部负载均衡器并绑定 NodePort | 关键公网四层入口，但每个 Service 独占一个外部 LB，成本较高 |
+| **Ingress** | L7 | 七层反向代理控制器（如 Ingress-Nginx、Envoy），通过单个公网入口 IP，根据 Host 域名和 Path 路由将请求转发至内部 ClusterIP | **生产首选外部 HTTP/HTTPS 入口**；支持 SSL 卸载、灰度切流、URL 路由收敛 |
+
 
 ## 大数据
 
