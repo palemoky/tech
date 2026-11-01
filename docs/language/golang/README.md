@@ -306,75 +306,6 @@ close 的语义就是发送方宣告「我发完了」，不是资源释放—�
 2. 广播退出信号，因为关闭是唯一能一次唤醒 N 个接收者的手段，发送做不到（发一次只有一个人收到）
 3. 多路 select 里需要感知某个源结束
 
-### 死锁
-
-死锁（deadlock）本质是：一组 goroutine **互相等待某个永远不会发生的事件**，导致所有相关 goroutine 无法继续执行。死锁发生时，程序会卡住，且 **不会有任何错误或堆栈**。
-
-Go 里最常见的死锁场景主要集中在：锁、`channel`、`WaitGroup`、资源顺序。
-
-#### 锁
-
-=== "重复加锁"
-
-    ```go
-    func main() {
-        var mu sync.Mutex
-
-        mu.Lock()
-        defer mu.Unlock()
-
-        mu.Lock() // 死锁
-    }
-    ```
-
-=== "忘记解锁"
-
-    ```go
-    func update() {
-        mu.Lock()
-
-        doSomething()
-
-        // 忘记 Unlock()
-    }
-    ```
-
-=== "两把锁互相等待"
-
-    goroutine 1：
-    ```go
-    a.Lock()
-    b.Lock()
-    ```
-
-    goroutine 2：
-    ```go
-    b.Lock()
-    a.Lock()
-    ```
-
-    导致相互持有对方的锁，永远等待。解决方式则是规定锁的顺序，比如固定先加 a 锁，再加 b 锁。
-
-#### channel
-
-1. Channel 无人发送
-2. 无缓冲 Channel 无人接收
-3. Channel 缓冲区满
-4. 从未关闭 channel 导致等待
-    
-#### 其他
-
-1. 忘记 `Done()` 导致 `wg.Wait()` 永久等待
-2. `select {}` 导致永久阻塞
-
-### goroutine 泄露
-
-1. 没有向 channel 发送数据或关闭 channel，导致 goroutine 无法退出
-2. HTTP 请求中启动后台 goroutine，没有取消机制
-3. `time.Ticker` 没有 Stop（<= Go 1.22）
-
-goroutine 泄露可通过 `pprof` 调试。
-
 ### 引发 panic
 
 1. 数组越界
@@ -891,14 +822,6 @@ GC 的触发条件有两个：
 
 ![GC 演进](imgs/gc_evolution_timeline.webp)
 
-#### 内存泄露
-
-1. goroutine 泄漏：无缓冲 Channel 向无接收者的 channel 发送数据，或从无发送者的 channel 接收数据且无 `select default/timeout`
-2. slice 引用大数组：如 `hugeSlice[:2]` 导致对底层的大数组的指针引用，无法回收，应该使用 `append([]T(nil), hugeSlice[:2]...)` 或 `slices.Clone()` 深拷贝所需数据
-3. map 元素过多：map 中删除元素只是标记删除，底层 bucket 不会缩减。如果 map 曾经很大后来元素减少，内存占用仍然很高。
-4. `sync.WaitGroup` 的 `Add` 和 `Done` 计数不匹配导致 `Wait()` 永远阻塞
-5. 资源未被关闭，如 HTTP Response Body、文件、数据库连接等
-
 ### 调度器
 
 #### GMP
@@ -950,6 +873,156 @@ Go 的 `Mutex` 主要有两种模式：
 | 饥饿 | 新到的 Goroutine 在队列中排队 | 公平 | 吞吐量低 |
 
 `Mutex` 不断在这两种模式中切换，当等待队列头部的 `goroutine` 等待时间超过 1ms 时，切换到饥饿模式；当获得锁的 `waiter` 是最后一个等待者、或其等待时间不足 1ms 时，切换回正常模式。
+
+## 生产常见故障
+
+Go 的线上故障多由**资源泄露、阻塞和并发控制不当**引起，往往不报错，属于**“静默”**问题。这些问题在本地低流量下很难复现，上线后容易集中爆发。
+
+### 排查工具
+
+绝大多数 Go 线上故障的定位都绕不开 **`pprof`**。在生产环境暴露一个受鉴权保护的 `net/http/pprof` 端点，可以快速分析 Goroutine 堆积在哪里、谁在占内存、谁在消耗 CPU。
+
+| 现象 | 可能的故障 | 排查手段 |
+| --- | --- | --- |
+| Goroutine 数量持续上涨 | [Goroutine 泄露](#goroutine-泄露) | `goroutine` profile |
+| RSS 或容器内存持续上涨，最终被 OOMKilled | [内存泄露](#内存泄露) | 对比两次 `heap` profile，或观察 `GODEBUG=gctrace=1` 输出 |
+| 程序无响应，CPU 和内存可能正常，但接口全部超时 | [死锁](#死锁) | `goroutine?debug=2` 查看完整堆栈 |
+| 进程崩溃并输出 `fatal error: concurrent map ...` | [数据竞争](#数据竞争与锁竞争) | 崩溃堆栈，测试时开启 `-race` |
+| 服务变慢但 CPU 不高 | [锁竞争](#数据竞争与锁竞争) | `mutex`、`block` profile |
+| 接口 RT 飙升，报 `connection pool timeout` | [连接池耗尽](#下游依赖) | 连接池指标 |
+| CPU 高或延迟抖动 | [性能与 GC 问题](#性能与-gc-问题) | CPU profile，`gctrace` |
+
+```bash
+# 查看 Goroutine 堆积在哪里，debug=2 输出每个 Goroutine 的完整堆栈
+curl 'http://localhost:6060/debug/pprof/goroutine?debug=2'
+
+# 采集 30 秒 CPU profile
+go tool pprof 'http://localhost:6060/debug/pprof/profile?seconds=30'
+
+# 对比两次堆快照，查看期间内存增长
+go tool pprof -base heap1.pb.gz heap2.pb.gz
+```
+
+> `mutex` 和 `block` profile 默认关闭，需要先调用 `runtime.SetMutexProfileFraction` 和 `runtime.SetBlockProfileRate` 开启。
+
+### Goroutine 泄露
+
+| 原因 | 修复 |
+| --- | --- |
+| 无限创建：每个请求或任务都启动 Goroutine，没有并发上限 | 对外入口用带缓冲的 channel 或协程池限流 |
+| 阻塞不退出：向无接收者的 channel 发送，或从无发送者的 channel 接收，且没有超时或退出分支 | 所有阻塞操作都带 `context` 超时或 `select` 退出分支 |
+| HTTP 请求中启动后台 Goroutine，没有取消机制 | 传入 `context`，监听 `ctx.Done()` 退出 |
+| `sync.WaitGroup` 的 `Add` 和 `Done` 计数不匹配，导致 `Wait()` 永久阻塞 | 在启动 Goroutine 前调用 `Add`，在 Goroutine 内 `defer wg.Done()` |
+
+### 内存泄露
+
+| 原因 | 修复 |
+| --- | --- |
+| 资源未关闭：最典型的是 `http.Get` 后忘记关闭 `resp.Body`，文件、数据库连接同理，导致连接和文件句柄泄露 | `defer resp.Body.Close()` |
+| 定时器未 Stop：`time.Ticker`、`time.Timer` 用完未调用 `Stop()`，底层资源无法回收（Go 1.23 起已修复，需 `go.mod` 声明 `go 1.23` 及以上） | `defer ticker.Stop()` |
+| 全局 map/slice 只增不减 | 设置容量上限或过期淘汰 |
+| map 不缩容：删除元素只是标记删除，底层 bucket 不会缩减，map 曾经很大时内存占用仍然很高 | 定期重建 map |
+| 子切片引用大数组：如 `hugeSlice[:2]` 持有底层大数组的引用，整个数组无法回收 | 用 `append([]T(nil), hugeSlice[:2]...)` 或 `slices.Clone()` 拷贝所需数据 |
+| 大对象一次性读入内存：如文件下载服务处理大文件时直接触发 OOM（不算泄露，但现象相同） | 用 `io.Copy` 流式处理 |
+
+排查时对比两次 `heap` profile，或观察 `GODEBUG=gctrace=1` 输出的 `#->#-># MB`，其中最后一个值（存活堆大小）持续上升就说明存在泄露。Goroutine 泄露也会导致内存上涨，建议同时查看 Goroutine 数量。
+
+### 死锁
+
+死锁（deadlock）本质是：一组 goroutine **互相等待某个永远不会发生的事件**，导致所有相关 goroutine 无法继续执行。
+
+所有 goroutine 都阻塞时，运行时会报 `fatal error: all goroutines are asleep - deadlock!` 并退出。但线上服务总有其他 goroutine 在运行或等待网络，运行时检测不到局部死锁，程序只是卡住，**不会有任何错误或堆栈**，需要通过 `goroutine?debug=2` 找到阻塞在同一把锁或同一个 channel 上的 goroutine。
+
+Go 里最常见的死锁场景主要集中在：锁、`channel`、`WaitGroup`、资源顺序。
+
+#### 锁
+
+=== "重复加锁"
+
+    ```go
+    func main() {
+        var mu sync.Mutex
+
+        mu.Lock()
+        defer mu.Unlock()
+
+        mu.Lock() // 死锁
+    }
+    ```
+
+=== "忘记解锁"
+
+    ```go
+    func update() {
+        mu.Lock()
+
+        doSomething()
+
+        // 忘记 Unlock()
+    }
+    ```
+
+=== "两把锁互相等待"
+
+    goroutine 1：
+    ```go
+    a.Lock()
+    b.Lock()
+    ```
+
+    goroutine 2：
+    ```go
+    b.Lock()
+    a.Lock()
+    ```
+
+    导致相互持有对方的锁，永远等待。解决方式则是规定锁的顺序，比如固定先加 a 锁，再加 b 锁。
+
+=== "读锁重入"
+
+    ```go
+    mu.RLock()
+
+    // 此时另一个 goroutine 调用 mu.Lock()，等待读锁释放
+
+    mu.RLock() // 被排队的写锁阻塞，形成循环等待
+    ```
+
+    `sync.RWMutex` 有写锁排队时会阻塞新的读锁，因此**禁止**递归加读锁。这种死锁只在特定并发下出现，线上表现为 goroutine 堆积。
+
+#### channel
+
+1. Channel 无人发送
+2. 无缓冲 Channel 无人接收
+3. Channel 缓冲区满
+4. 从未关闭 channel 导致等待
+5. 发送方和接收方互相等待对方先行动
+
+#### 其他
+
+1. 忘记 `Done()` 导致 `wg.Wait()` 永久等待
+2. `select {}` 导致永久阻塞
+
+### 数据竞争与锁竞争
+
+| 原因 | 修复 |
+| --- | --- |
+| Map 并发读写：内置 map 非并发安全，多个 Goroutine 同时读写会触发 `fatal error: concurrent map read and map write`，进程直接崩溃，且无法被 `recover` 捕获 | 用 `sync.RWMutex` 保护，或使用 `sync.Map`；测试时开启 `-race` |
+| 锁粒度不当：用全局大锁包裹耗时的 IO 或网络请求，高并发下所有请求排队执行，吞吐量暴跌，表现为“服务变慢但 CPU 不高” | 缩小临界区，不在持锁时做 IO；或拆分锁 |
+
+### 下游依赖
+
+| 原因 | 修复 |
+| --- | --- |
+| 连接池过小：例如 `go-redis` 的 `PoolSize` 设置过小，高峰期大量 Goroutine 拿不到连接，抛出 `connection pool timeout`，接口 RT 飙升 | 按峰值并发调整连接池大小，排查占用连接的慢查询 |
+| 重试风暴：下游变慢时，上游多层重试叠加，瞬间放大流量，压垮下游或自身 | 限制重试次数，使用指数退避加随机抖动，只在一层重试，配合熔断 |
+
+### 性能与 GC 问题
+
+| 原因 | 修复 |
+| --- | --- |
+| GC 压力过大：对象分配速率过快，GC 频繁运行，后台标记和标记辅助（mark assist）抢占业务 CPU，导致接口延迟抖动、超时率上升 | 用 `heap` profile 的 `alloc_space` 找到分配热点，减少分配或用 `sync.Pool` 复用对象；调整 `GOGC`、`GOMEMLIMIT` |
+| CPU 热点：某个函数占用大量 CPU 时间，如低效的正则、序列化大对象、`for` + `select default` 空转 | 用 CPU profile 定位并优化 |
 
 ## 版本变化
 
