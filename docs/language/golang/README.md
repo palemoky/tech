@@ -773,28 +773,54 @@ recvq: [G7]           ← G7 被挂起等待数据
 
 ### context
 
-取消信号的传播是通过 Context 的层级结构实现的，**父 Context 取消时，所有子 Context 都会自动取消**。
+Context 用于在 Goroutine 之间传递取消信号、截止时间和请求级别的元数据。
 
-Context 提供了以下 4 种方法：
+#### Context 接口
 
 ```go
 type Context interface {
-    Deadline() (deadline time.Time, ok bool)  // 第一个返回值是 Context 的截止时间点（绝对时间），第二个返回值代表该 Context 是否被设置了超时时间
-    Done() <-chan struct{}                    // Done() 返回一个只读 channel，当这个 channel 被关闭时，说明这个 context 被取消
-    Err() error                               // Err() 返回一个错误，表示 channel 被关闭的原因，例如是被取消，还是超时关闭
-    Value(key interface{}) interface{}        // Value 方法返回指定 key 对应的 value，这是 context 携带的值
+    Deadline() (deadline time.Time, ok bool)  // 返回截止时间（绝对时间），ok 表示是否设置了截止时间
+    Done() <-chan struct{}                    // 返回只读 channel，channel 关闭表示 Context 已被取消
+    Err() error                               // 返回 Done 关闭的原因：被取消或超时
+    Value(key any) any                        // 返回 key 对应的值
 }
 ```
 
-`Context.Value` 的查找过程是一个链式递归查找的过程，从当前 Context 开始，沿着父 Context 链一直**向上查找**，直到找到对应的 key 或者到达根 Context。
+#### 创建 Context
 
-`ctx.Done()` 会在以下情况被触发（channel 被关闭）：
+根 Context：
 
-- 手动取消（`cancel()`）
-- 超时（`WithTimeout()`）
-- 到达截止时间（`WithDeadline()`）
+| 函数 | 说明 |
+| --- | --- |
+| `context.Background()` | 默认的根 Context，用于 `main`、初始化和请求入口 |
+| `context.TODO()` | 占位用，暂时不确定该传哪个 Context 时使用 |
+
+派生 Context：
+
+| 用途 | 函数 | 说明 |
+| --- | --- | --- |
+| 超时控制 | `context.WithTimeout(parent, duration)` | 经过指定时长后自动取消 |
+| 超时控制 | `context.WithDeadline(parent, time.Time)` | 到达指定时间点后自动取消 |
+| 主动取消 | `context.WithCancel(parent)` | 常用于协调多个 Goroutine 主动退出 |
+| 主动取消 | `context.WithCancelCause(parent)` | 取消时可携带原因，通过 `context.Cause(ctx)` 读取 |
+| 跨链路传值 | `context.WithValue(parent, key, val)` | 跨 API 边界传递请求级别的元数据（如 TraceID、登录用户信息） |
+| 断开取消链 | `context.WithoutCancel(parent)` | 不随父 Context 取消，但保留其中的值。常用于请求结束后继续执行后台任务（如异步写入、发邮件），同时保留 TraceID |
+| 优雅停机 | `signal.NotifyContext(parent, signals...)` | 捕获到指定系统信号（如 `SIGINT`、`SIGTERM`）时自动取消，常用于服务平滑退出 |
+
+#### 取消传播
+
+取消信号沿 Context 的层级结构向下传播，**父 Context 取消时，所有子 Context 都会自动取消**，子 Context 取消则不影响父 Context。
+
+`ctx.Done()` 返回的 channel 会在以下情况被关闭：
+
+- 手动调用 `cancel()`
+- 超时或到达截止时间（`WithTimeout()`、`WithDeadline()`）
 - 父 Context 被取消
-- 请求被取消（HTTP / gRPC 等场景下断开连接，底层调用 `cancel()`，从而触发 `ctx.Done()`）
+- HTTP / gRPC 等场景下连接断开或请求结束，框架底层调用 `cancel()`
+
+#### 值查找
+
+`ctx.Value(key)` 从当前 Context 开始，沿父 Context 链逐层**向上查找**，直到找到对应的 key 或到达根 Context。
 
 ### sync.Map
 
