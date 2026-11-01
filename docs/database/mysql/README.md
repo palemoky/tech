@@ -174,6 +174,137 @@ WHERE user_id = 1 AND version = <old_version> AND balance >= 100;
     - **基因法（Gene）**：生成 `order_id` 时，将 `user_id` 的低几位哈希值嵌入 `order_id` 的后缀，这样仅凭 `order_id` 即可推导出所在分片。
     - **双写与异构索引**：通过 Canal / CDC 监听 Binlog，异步同步到 Elasticsearch，复杂的多条件检索、聚合及后台查询全部走 ES，实现读写分离的 CQRS 架构。
 
+## 生产常见故障
+
+MySQL 的线上故障往往是连锁反应：一条慢 SQL 或一个长事务占住资源，后续请求不断堆积，最终连接耗尽，接口全部超时。因此定位时要先找到**堆积的源头**，而不是只看最后的报错。
+
+### 排查工具
+
+| 现象 | 可能的故障 | 排查手段 |
+| --- | --- | --- |
+| 接口变慢，CPU 或 IO 飙高 | [慢查询](#慢查询) | 慢查询日志、`EXPLAIN` |
+| 报 `Too many connections` | [连接数耗尽](#连接数耗尽) | `SHOW FULL PROCESSLIST` |
+| 报 `Lock wait timeout exceeded` | [锁等待](#锁等待与死锁)、[长事务](#长事务与大事务) | `sys.innodb_lock_waits`、`information_schema.innodb_trx` |
+| 报 `Deadlock found` | [死锁](#锁等待与死锁) | `SHOW ENGINE INNODB STATUS` |
+| 大量线程处于 `Waiting for table metadata lock` | [DDL 阻塞](#ddl-阻塞) | `sys.schema_table_lock_waits` |
+| 从库读到旧数据 | [主从延迟](#主从延迟) | `SHOW REPLICA STATUS` |
+| 磁盘使用率持续上涨 | [容量问题](#容量问题) | 检查 binlog、undo、慢查询日志的大小 |
+
+```sql
+-- 查看所有连接正在执行的 SQL
+SHOW FULL PROCESSLIST;
+
+-- 查找运行超过 60 秒的事务
+SELECT trx_id, trx_mysql_thread_id, trx_started, trx_query
+FROM information_schema.innodb_trx
+WHERE trx_started < NOW() - INTERVAL 60 SECOND;
+
+-- 查看谁在阻塞谁
+SELECT * FROM sys.innodb_lock_waits;
+
+-- 查看最近一次死锁
+SHOW ENGINE INNODB STATUS;
+
+-- 终止指定连接，线程 ID 来自上面的查询
+KILL <thread_id>;
+```
+
+### 慢查询
+
+开启 `slow_query_log`，并调低 `long_query_time`（默认 10 秒），再用 `pt-query-digest` 汇总慢查询日志，找出总耗时最高的 SQL。`EXPLAIN` 重点关注 `type`（`ALL` 表示全表扫描）、`rows`（预估扫描行数）和 `Extra`（`Using filesort`、`Using temporary`）。
+
+| 原因 | 修复 |
+| --- | --- |
+| [索引](#索引)失效：对索引列使用函数、隐式类型转换、`like '%...'` | 改写 SQL，保持条件中的类型一致 |
+| 深分页：`LIMIT 1000000, 20` 要扫描并丢弃前面所有行 | 用游标分页 `WHERE id > ? LIMIT 20`，或先通过覆盖索引查出 ID 再回表 |
+| `SELECT *` 或大结果集：回表次数多，网络传输量大 | 只查需要的字段，使用覆盖索引 |
+| 排序或分组没有走索引，产生文件排序或临时表 | 为排序字段建立联合索引 |
+| 优化器选错索引：统计信息不准确 | 执行 `ANALYZE TABLE`，必要时用 `FORCE INDEX` |
+
+### 连接数耗尽
+
+连接数达到 `max_connections`（默认 151）后，新连接会报 `Too many connections`。此时 MySQL 为管理员保留了一个额外连接，8.0.14 起也可以通过 `admin_port` 配置独立的管理端口。
+
+| 原因 | 修复 |
+| --- | --- |
+| 慢查询或锁等待导致连接被长期占用 | 用 `KILL` 终止源头 SQL，再治理慢查询 |
+| 应用实例数 × 连接池大小超过 `max_connections` | 扩容前核算总连接数，必要时引入数据库代理 |
+| 连接未归还：事务没有提交或回滚，`rows` 没有关闭 | 用 `defer` 等机制确保释放，并监控连接池使用率 |
+| 业务高峰时大量请求排队 | 设置查询超时和连接池等待超时，超时后快速失败 |
+
+连接池的连接最大存活时间要小于 `wait_timeout`，否则应用可能拿到已被 MySQL 关闭的连接，报 `MySQL server has gone away`。
+
+### 长事务与大事务
+
+**长事务**指运行时间长的事务，最常见的原因是在事务里调用 RPC、HTTP 等外部接口，或者框架关闭了自动提交后事务一直未结束。它的危害有：
+
+- 持有的行锁直到提交才释放，阻塞其他写入
+- undo log 无法清理，导致 undo 膨胀，其他查询遍历版本链时也会变慢
+- 持有元数据锁，引发 [DDL 阻塞](#ddl-阻塞)
+
+**大事务**指一次修改大量数据的事务，如一次 `DELETE` 上百万行。它的危害有：
+
+- 回滚耗时可能比执行更长
+- binlog 集中写入，引发[主从延迟](#主从延迟)
+
+修复方式：事务内不做外部调用，只包含必要的 SQL；批量操作按主键范围分批执行，每批单独提交；监控 `information_schema.innodb_trx`，对超过阈值的事务告警。
+
+### 锁等待与死锁
+
+InnoDB 的行锁是加在索引上的，事务持有的锁要到提交时才释放。等待超过 `innodb_lock_wait_timeout`（默认 50 秒）时，报 `Lock wait timeout exceeded`。
+
+InnoDB 会自动检测死锁，并回滚代价最小的事务，被回滚的一方报 `Deadlock found`。因此**业务代码要捕获这个错误并重试**。
+
+| 原因 | 修复 |
+| --- | --- |
+| `UPDATE` / `DELETE` 的条件没有走索引：RR 隔离级别下会锁住扫描过的所有行，效果接近锁表 | 确保条件字段有索引 |
+| 加锁顺序不一致：如两个账户互相转账（见[并发操作金额](#并发操作金额)） | 按固定顺序加锁，比如按账户 ID 排序 |
+| 间隙锁冲突：两个事务先 `SELECT ... FOR UPDATE` 同一个不存在的记录，再 `INSERT`。间隙锁互相兼容，但插入时要等待对方的间隙锁 | 用 `INSERT ... ON DUPLICATE KEY UPDATE` 或唯一索引代替先查后插；业务允许时使用 RC 隔离级别 |
+| 事务过长，持锁时间久 | 缩短事务，把最容易冲突的更新放到最后执行 |
+
+### DDL 阻塞
+
+所有查询和写入都持有元数据锁（MDL）读锁，事务提交后才释放，而 DDL 需要 MDL 写锁。典型的故障过程是：
+
+1. 一个未提交的长事务持有 MDL 读锁
+2. `ALTER TABLE` 等待 MDL 写锁
+3. 后续所有查询都排在写锁之后，这张表完全不可读写
+4. 请求堆积，连接耗尽
+
+这个问题即使对小表也会发生，修复方式如下：
+
+- 变更前检查 `information_schema.innodb_trx`，确认没有长事务
+- 设置 `SET lock_wait_timeout = 5`，让 DDL 等待超时后放弃，默认值是一年
+- 能用 `ALGORITHM=INSTANT`（如 8.0 加列）时优先使用
+- 大表使用 `ALGORITHM=INPLACE, LOCK=NONE`，或 `gh-ost`、`pt-online-schema-change`，并在业务低峰执行
+
+### 主从延迟
+
+主从延迟的表现是写入后立刻读取却读不到新数据。`SHOW REPLICA STATUS` 的 `Seconds_Behind_Source` 可以查看延迟。
+
+| 原因 | 修复 |
+| --- | --- |
+| 大事务或大表 DDL：从库要花同样长的时间回放 | 拆分大事务，用 `gh-ost` 等工具限速变更 |
+| 从库回放能力不足 | 开启基于 WRITESET 的并行复制，从库配置不低于主库 |
+| 从库读压力过大 | 增加从库，分散读流量 |
+| 表没有主键：row 格式下每行变更都可能要全表扫描 | 所有表都设置主键 |
+
+对于必须读到最新数据的场景，写入后的关键读要强制走主库。
+
+### 容量问题
+
+| 问题 | 现象 | 修复 |
+| --- | --- | --- |
+| 磁盘写满 | 写入全部挂起 | 配置 `binlog_expire_logs_seconds` 自动清理 binlog，治理长事务导致的 undo 膨胀，轮转慢查询日志 |
+| `DELETE` 后空间不释放 | 表文件大小不变 | 删除的空间只是标记为可复用，需要用 `OPTIMIZE TABLE` 重建表 |
+| 自增主键耗尽 | `INT` 达到 2147483647 后，写入报 `Duplicate entry` | 主键使用 `BIGINT`，并监控自增 ID 的使用率 |
+
+### 误操作恢复
+
+误删数据时，先恢复全量备份到临时实例，再回放 binlog 到误操作之前的位置（PITR），确认无误后把数据导回线上。row 格式的 binlog 也可以用 `binlog2sql`、`MyFlash` 等工具生成反向 SQL。
+
+预防措施：定期演练备份恢复；开启 `sql_safe_updates`，拒绝没有 `WHERE` 或 `LIMIT` 的更新；保留延迟从库，为发现问题留出时间。
+
 ## FAQ
 ### MySQL
 
