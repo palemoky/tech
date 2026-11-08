@@ -1,11 +1,11 @@
-# MkDocs / Zensical
+# Zensical
 site/
+.cache/
+
+# Python
+.venv/
+__pycache__/
 main.py
-uv.lock
-pyproject.toml 
-.python-version
-.venv
-.cache
 
 # macOS
 .DS_Store
@@ -19,8 +19,11 @@ pyproject.toml
 *.swo
 *~
 
-# Python
-__pycache__/
+# Office
+~$*
+
+# Env
+.env
 
 # Temporary files
 *.tmp
